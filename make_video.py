@@ -1,4 +1,4 @@
-import asyncio, json, os, subprocess, sys
+import asyncio, json, os, subprocess, sys, time
 import edge_tts, requests
 from PIL import Image, ImageDraw, ImageFont
 
@@ -102,23 +102,39 @@ def main():
     final = f"{OUT}/final.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", f"{OUT}/list.txt",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", final],
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         "-ar", "44100", "-ac", "2", "-movflags", "+faststart", final],
         check=True, capture_output=True)
     print("영상 완성:", final, f"({duration(final):.1f}초)")
 
     token = os.environ.get("TELEGRAM_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
-    if token and chat:
-        with open(final, "rb") as v:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendVideo",
-                data={"chat_id": chat, "caption": data.get("caption", "")},
-                files={"video": v}, timeout=120)
-        print("텔레그램 전송:", r.status_code)
-        if r.status_code != 200:
-            sys.exit(r.text)
-    else:
+    if not (token and chat):
         print("텔레그램 키가 없어 전송은 건너뜀")
+        return
+
+    caption = data.get("caption", "")
+    tag = "p" + time.strftime("%Y%m%d-%H%M%S")
+    # 승인 전까지 영상을 GitHub 릴리스에 임시 보관
+    subprocess.run(
+        ["gh", "release", "create", tag, final, "--title", tag,
+         "--notes", caption, "--prerelease"], check=True)
+    print("임시 보관:", tag)
+
+    buttons = {"inline_keyboard": [[
+        {"text": "✅ 승인 (업로드)", "callback_data": f"ok:{tag}"},
+        {"text": "❌ 거절", "callback_data": f"no:{tag}"},
+    ]]}
+    tg_caption = ("📝 업로드 대기 중 (승인 후 5~15분 안에 올라가요)\n\n" + caption)[:1000]
+    with open(final, "rb") as v:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendVideo",
+            data={"chat_id": chat, "caption": tg_caption,
+                  "reply_markup": json.dumps(buttons)},
+            files={"video": v}, timeout=120)
+    print("텔레그램 전송:", r.status_code)
+    if r.status_code != 200:
+        sys.exit(r.text)
 
 
 if __name__ == "__main__":
