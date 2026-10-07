@@ -30,25 +30,29 @@ def fetch_news(query):
     return items
 
 
-def pick_model(key):
+def list_models(key):
+    """쓸 수 있는 flash 모델을 좋은 순서(최신, 안정판 우선)로 돌려줍니다."""
     forced = os.environ.get("GEMINI_MODEL")
     if forced:
-        return forced
+        return [forced]
     r = requests.get(f"{API}/models", params={"key": key, "pageSize": 200}, timeout=30)
     r.raise_for_status()
-    bad = ("lite", "image", "tts", "live", "audio", "embed", "robotics",
+    bad = ("image", "tts", "live", "audio", "embed", "robotics",
            "computer", "aqa", "imagen", "veo", "gemma", "learnlm")
-    cands = []
+    main, lite = [], []
     for m in r.json().get("models", []):
         name = m["name"].split("/")[-1]
         if ("generateContent" in m.get("supportedGenerationMethods", [])
                 and "flash" in name and not any(b in name for b in bad)):
             v = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
             if v:
-                cands.append((float(v.group(1)), "preview" not in name, name))
-    if not cands:
+                item = (float(v.group(1)), "preview" not in name, name)
+                (lite if "lite" in name else main).append(item)
+    ordered = [n for _, _, n in sorted(main, reverse=True)] + \
+              [n for _, _, n in sorted(lite, reverse=True)]
+    if not ordered:
         sys.exit("사용 가능한 Gemini flash 모델을 찾지 못했습니다.")
-    return sorted(cands)[-1][2]
+    return ordered[:5]
 
 
 PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제목들을 바탕으로 30초 분량의 뉴스 영상 대본을 JSON으로만 써라.
@@ -81,7 +85,7 @@ def ask_gemini(key, model, prompt):
         json={"contents": [{"parts": [{"text": prompt}]}],
               "generationConfig": {"responseMimeType": "application/json",
                                    "temperature": 0.6}},
-        timeout=90)
+        timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"Gemini 오류 {r.status_code}: {r.text[:300]}")
     parts = r.json()["candidates"][0]["content"]["parts"]
@@ -125,23 +129,27 @@ def main():
         sys.exit("새 뉴스를 찾지 못했습니다.")
     print("선택한 기사:", chosen["title"], "-", chosen["source"])
 
-    model = pick_model(key)
-    print("사용 모델:", model)
+    models = list_models(key)
+    print("사용할 모델 순서:", models)
     prompt = PROMPT.format(title=chosen["title"], source=chosen["source"] or "언론사",
                            date=chosen["date"], others="\n".join("- " + o for o in others) or "(없음)")
     data = None
-    for attempt in range(3):
-        try:
-            d = ask_gemini(key, model, prompt)
-            if valid(d):
-                data = d
-                break
-            print("형식이 맞지 않아 다시 시도합니다.")
-        except Exception as e:
-            print("재시도:", e)
-        time.sleep(5)
+    for model in models:
+        for attempt in range(3):
+            try:
+                print(f"시도: {model} ({attempt + 1}/3)")
+                d = ask_gemini(key, model, prompt)
+                if valid(d):
+                    data = d
+                    break
+                print("형식이 맞지 않아 다시 시도합니다.")
+            except Exception as e:
+                print("실패:", str(e)[:200])
+            time.sleep(10 * (attempt + 1))
+        if data:
+            break
     if not data:
-        sys.exit("대본 생성에 실패했습니다.")
+        sys.exit("대본 생성에 실패했습니다. 잠시 후 다시 실행해 주세요.")
 
     json.dump(data, open("scenes.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     used.append(chosen["title"])
