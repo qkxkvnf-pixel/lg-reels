@@ -1,6 +1,8 @@
 name: make-video
 on:
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,11 +17,21 @@ jobs:
           sudo apt-get install -y fonts-nanum ffmpeg
       - name: 패키지 설치
         run: pip install -r requirements.txt
+      - name: 뉴스 찾고 대본 만들기
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python make_scenes.py
       - name: 영상 만들고 텔레그램으로 보내기
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python make_video.py
+      - name: 사용한 기사 기록 저장
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add used.json
+          git diff --staged --quiet || (git commit -m "update used.json" && git push)
       - uses: actions/upload-artifact@v4
         with:
           name: video
