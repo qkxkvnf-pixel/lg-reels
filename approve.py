@@ -1,5 +1,5 @@
 """텔레그램 승인/거절 버튼을 확인하고, 승인된 영상을 인스타 릴스로 올립니다."""
-import json, os, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 from datetime import datetime, timezone
 import requests
 
@@ -124,6 +124,35 @@ def handle(cq):
            reply_markup=buttons(tag))
 
 
+_help_sent = False
+
+
+def handle_message(m):
+    """내가 텔레그램으로 보낸 기사 링크를 받아 영상 제작을 시작합니다."""
+    global _help_sent
+    if str(m.get("chat", {}).get("id")) != CHAT:
+        return
+    if time.time() - m.get("date", 0) > 3600:      # 오래된 메시지는 무시
+        return
+    text = m.get("text") or ""
+    urls = re.findall(r"https?://[^\s<>\"']+", text)[:3]
+    if not urls:
+        if not _help_sent:
+            _help_sent = True
+            tg("sendMessage", chat_id=CHAT,
+               text="📎 영상으로 만들 기사 링크를 보내주세요.\n링크를 받으면 영상을 만들어 승인 요청을 보내드려요.")
+        return
+    for u in urls:
+        r = gh("workflow", "run", "make-video.yml", "-f", f"url={u}", check=False)
+        if r.returncode == 0:
+            tg("sendMessage", chat_id=CHAT,
+               text="🔗 링크를 받았어요. 영상을 만드는 중이에요 (약 5~10분).\n완성되면 승인 버튼과 함께 보내드릴게요.")
+        else:
+            print("실행 실패:", r.stderr[:300])
+            tg("sendMessage", chat_id=CHAT,
+               text="⚠️ 영상 제작을 시작하지 못했어요. 잠시 후 링크를 다시 보내주세요.")
+
+
 def cleanup_old():
     """3일 넘게 방치된 임시 영상은 자동으로 지웁니다."""
     r = gh("release", "list", "--json", "tagName,createdAt", check=False)
@@ -141,7 +170,7 @@ def cleanup_old():
 
 def main():
     r = requests.get(f"{TG}/getUpdates",
-                     params={"timeout": 0, "allowed_updates": json.dumps(["callback_query"])},
+                     params={"timeout": 0, "allowed_updates": json.dumps(["callback_query", "message"])},
                      timeout=60).json()
     ups = r.get("result", [])
     if ups:
@@ -151,6 +180,8 @@ def main():
         for u in ups:
             if "callback_query" in u:
                 handle(u["callback_query"])
+            elif "message" in u:
+                handle_message(u["message"])
     else:
         print("새 버튼 입력 없음")
     cleanup_old()
