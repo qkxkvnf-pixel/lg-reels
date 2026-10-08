@@ -1,6 +1,11 @@
 name: make-video
 on:
   workflow_dispatch:
+    inputs:
+      url:
+        description: "기사 링크 (비워두면 자동으로 기사를 고릅니다)"
+        required: false
+        default: ""
   schedule:
     - cron: "0 2,6,11 * * *"   # 매일 한국시간 11:00, 15:00, 20:00
 permissions:
@@ -25,6 +30,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ARTICLE_URL: ${{ github.event.inputs.url }}
         run: python make_scenes.py
       - name: 영상 만들고 승인 요청 보내기
         env:
