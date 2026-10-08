@@ -5,6 +5,7 @@ on:
     - cron: "*/5 * * * *"
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: approval
   cancel-in-progress: false
