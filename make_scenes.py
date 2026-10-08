@@ -1,16 +1,29 @@
-"""최신 가전 뉴스를 찾아서 30초 뉴스 대본(scenes.json)을 자동으로 만듭니다."""
-import json, os, random, re, sys, time
+"""최근 7일 이내의 긍정적인 가전 뉴스를 골라 30초 뉴스 대본(scenes.json)을 만듭니다.
+우선순위: 1) LG전자 베스트샵  2) 혼수 가전  3) LG전자 가전 신제품"""
+import json, os, re, sys, time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 import requests
 
-QUERIES = [
-    "LG전자 베스트샵",
-    "LG전자 신제품 가전",
-    "혼수 가전 LG전자",
-    "LG전자 가전 트렌드",
+MAX_AGE_DAYS = 7
+GROUPS = [
+    ("LG전자 베스트샵", ["LG전자 베스트샵", "LG베스트샵"]),
+    ("혼수 가전", ["혼수 가전 LG전자", "혼수 가전 트렌드", "혼수 가전"]),
+    ("LG전자 가전 신제품", ["LG전자 가전 신제품", "LG전자 신제품 출시"]),
 ]
 API = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def notify(text):
+    t, c = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if t and c:
+        try:
+            requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
+                          data={"chat_id": c, "text": text}, timeout=30)
+        except Exception as e:
+            print("알림 실패:", e)
 
 
 def fetch_news(query):
@@ -22,23 +35,53 @@ def fetch_news(query):
     for it in ET.fromstring(r.content).iter("item"):
         title = (it.findtext("title") or "").strip()
         source = (it.findtext("source") or "").strip()
-        # 제목 끝의 " - 언론사" 제거
         if source and title.endswith(" - " + source):
             title = title[: -len(" - " + source)]
-        items.append({"title": title, "source": source,
-                      "date": (it.findtext("pubDate") or "")[:16]})
+        try:
+            dt = parsedate_to_datetime(it.findtext("pubDate"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue  # 날짜를 모르면 쓰지 않는다
+        items.append({"title": title, "source": source, "dt": dt})
     return items
 
 
+def collect_candidates(used):
+    """그룹별로 최근 7일 이내, 아직 안 쓴 기사만 모읍니다."""
+    limit = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+    cands, seen = [], set()
+    for gi, (gname, queries) in enumerate(GROUPS):
+        pool = []
+        for q in queries:
+            try:
+                pool += fetch_news(q)
+            except Exception as e:
+                print("뉴스 수집 실패:", q, e)
+        pool.sort(key=lambda x: x["dt"], reverse=True)
+        n = 0
+        for it in pool:
+            if it["dt"] < limit or it["title"] in used or it["title"] in seen:
+                continue
+            seen.add(it["title"])
+            it["group"] = gi
+            it["gname"] = gname
+            cands.append(it)
+            n += 1
+            if n >= 7:
+                break
+        print(f"[{gname}] 후보 {n}개")
+    return cands
+
+
 def list_models(key):
-    """쓸 수 있는 flash 모델을 좋은 순서(최신, 안정판 우선)로 돌려줍니다."""
     forced = os.environ.get("GEMINI_MODEL")
     if forced:
         return [forced]
     r = requests.get(f"{API}/models", params={"key": key, "pageSize": 200}, timeout=30)
     r.raise_for_status()
-    bad = ("image", "tts", "live", "audio", "embed", "robotics",
-           "computer", "aqa", "imagen", "veo", "gemma", "learnlm")
+    bad = ("image", "tts", "live", "audio", "embed", "robotics", "computer",
+           "aqa", "imagen", "veo", "gemma", "learnlm")
     main, lite = [], []
     for m in r.json().get("models", []):
         name = m["name"].split("/")[-1]
@@ -55,7 +98,54 @@ def list_models(key):
     return ordered[:5]
 
 
-PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제목들을 바탕으로 30초 분량의 뉴스 영상 대본을 JSON으로만 써라.
+def ask_gemini(key, model, prompt):
+    r = requests.post(
+        f"{API}/models/{model}:generateContent",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json={"contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"responseMimeType": "application/json",
+                                   "temperature": 0.5}},
+        timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini 오류 {r.status_code}: {r.text[:300]}")
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    return json.loads(text.replace("```json", "").replace("```", "").strip())
+
+
+def run_gemini(key, models, prompt, check):
+    """모델을 바꿔가며, 점점 길게 기다리며 재시도합니다."""
+    for model in models:
+        for attempt in range(3):
+            try:
+                print(f"시도: {model} ({attempt + 1}/3)")
+                d = ask_gemini(key, model, prompt)
+                if check(d):
+                    return d
+                print("형식이 맞지 않아 다시 시도합니다.")
+            except Exception as e:
+                print("실패:", str(e)[:200])
+            time.sleep(10 * (attempt + 1))
+    return None
+
+
+SELECT_PROMPT = """너는 뉴스 편집자다. 아래 후보 기사 제목 중 영상으로 만들 기사 한 개를 골라라.
+
+선택 기준 (중요한 순서):
+1. 긍정적이거나 호의적인 소식만 고른다. 예: 신제품 출시, 매장 오픈·리뉴얼, 수상, 고객 혜택·행사, 판매 호조, 트렌드 확산.
+   리콜, 결함, 사고, 소송, 논란, 파업, 실적 악화, 가격 인상, 불매, 안전·품질 문제, 경쟁사 비교 비판 등 부정적 소식은 반드시 제외한다.
+2. 주제 우선순위: (1순위) LG전자 베스트샵 관련 → (2순위) 혼수 가전 관련 → (3순위) LG전자 가전 신제품.
+   높은 순위에 적합한 기사가 있으면 반드시 그 기사를 고른다.
+3. 제목이 LG전자 또는 베스트샵 또는 혼수 가전과 실제로 관련이 없으면 제외한다.
+4. 기준에 맞는 기사가 하나도 없으면 -1을 답한다.
+
+후보:
+{lines}
+
+출력(JSON만): {{"index": 번호}}"""
+
+
+SCRIPT_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제목들을 바탕으로 30초 분량의 뉴스 영상 대본을 JSON으로만 써라.
 
 [메인 기사]
 제목: {title}
@@ -66,34 +156,22 @@ PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제목들을
 
 규칙:
 - 제목들에 나온 사실만 사용한다. 숫자, 날짜, 인물, 제품명을 지어내지 않는다.
-- 제목만으로 알 수 없는 내용은 쓰지 않는다. 추측, 과장, 광고 문구를 쓰지 않는다.
+- 제목만으로 알 수 없는 내용은 쓰지 않는다. 추측, 과장, 광고 문구를 쓰지 않는다. 밝고 긍정적인 톤으로 쓴다.
 - 장면은 4개. 각 장면의 headline은 18자 이내, narration은 45자 이내의 자연스러운 뉴스 구어체.
 - 전체 narration 합계는 170자 안팎이다.
 - 첫 장면은 시선을 끄는 한 문장, 마지막 장면은 정리 한 문장이다.
 - 이 영상은 LG전자 공식 채널이 아니므로 공식 입장처럼 말하지 않는다.
+- 각 장면에 image_query를 넣는다. 그 장면에 어울리는 사진을 찾기 위한 영어 검색어 2~4단어다.
+  일반적인 장면을 묘사한다. 예: "modern kitchen appliances", "couple new home living room", "washing machine laundry room", "electronics store showroom".
+  브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
 - caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다.
 
 출력 형식(JSON만, 설명 금지):
-{{"caption": "...", "scenes": [{{"headline": "...", "narration": "..."}}]}}
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "..."}}]}}
 """
 
 
-def ask_gemini(key, model, prompt):
-    r = requests.post(
-        f"{API}/models/{model}:generateContent",
-        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"responseMimeType": "application/json",
-                                   "temperature": 0.6}},
-        timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini 오류 {r.status_code}: {r.text[:300]}")
-    parts = r.json()["candidates"][0]["content"]["parts"]
-    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-    return json.loads(text.replace("```json", "").replace("```", "").strip())
-
-
-def valid(d):
+def valid_script(d):
     try:
         sc = d["scenes"]
         return (3 <= len(sc) <= 5
@@ -104,50 +182,49 @@ def valid(d):
         return False
 
 
+def skip(msg):
+    print(msg)
+    if os.path.exists("scenes.json"):
+        os.remove("scenes.json")
+    notify("ℹ️ " + msg)
+    sys.exit(0)
+
+
 def main():
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         sys.exit("GEMINI_API_KEY 가 없습니다. Secrets에 추가해 주세요.")
+    if os.path.exists("scenes.json"):
+        os.remove("scenes.json")  # 지난번 대본이 남아 있지 않게
     used = json.load(open("used.json", encoding="utf-8")) if os.path.exists("used.json") else []
 
-    queries = QUERIES[:]
-    random.shuffle(queries)
-    chosen, others = None, []
-    for q in queries:
-        try:
-            items = fetch_news(q)
-        except Exception as e:
-            print("뉴스 수집 실패:", q, e)
-            continue
-        fresh = [i for i in items if i["title"] not in used]
-        if fresh:
-            chosen = fresh[0]
-            others = [i["title"] for i in items if i["title"] != chosen["title"]][:6]
-            print("선택한 검색어:", q)
-            break
-    if not chosen:
-        sys.exit("새 뉴스를 찾지 못했습니다.")
-    print("선택한 기사:", chosen["title"], "-", chosen["source"])
+    cands = collect_candidates(used)
+    if not cands:
+        skip("최근 7일 이내의 새 기사가 없어서 이번 영상은 건너뛰었어요.")
 
     models = list_models(key)
     print("사용할 모델 순서:", models)
-    prompt = PROMPT.format(title=chosen["title"], source=chosen["source"] or "언론사",
-                           date=chosen["date"], others="\n".join("- " + o for o in others) or "(없음)")
-    data = None
-    for model in models:
-        for attempt in range(3):
-            try:
-                print(f"시도: {model} ({attempt + 1}/3)")
-                d = ask_gemini(key, model, prompt)
-                if valid(d):
-                    data = d
-                    break
-                print("형식이 맞지 않아 다시 시도합니다.")
-            except Exception as e:
-                print("실패:", str(e)[:200])
-            time.sleep(10 * (attempt + 1))
-        if data:
-            break
+
+    lines = "\n".join(
+        f"[{i}] ({c['group'] + 1}순위: {c['gname']}) {c['title']} - {c['source']} ({c['dt'].strftime('%m/%d')})"
+        for i, c in enumerate(cands))
+    sel = run_gemini(key, models, SELECT_PROMPT.format(lines=lines),
+                     lambda d: isinstance(d.get("index"), int)
+                     and -1 <= d["index"] < len(cands))
+    if sel is None:
+        sys.exit("기사 선택에 실패했습니다. 잠시 후 다시 실행해 주세요.")
+    if sel["index"] == -1:
+        skip("긍정적이고 관련 있는 새 기사가 없어서 이번 영상은 건너뛰었어요.")
+    chosen = cands[sel["index"]]
+    print("선택한 기사:", chosen["title"], "-", chosen["source"], f"({chosen['gname']})")
+
+    others = [c["title"] for c in cands
+              if c["title"] != chosen["title"] and c["group"] == chosen["group"]][:6]
+    prompt = SCRIPT_PROMPT.format(
+        title=chosen["title"], source=chosen["source"] or "언론사",
+        date=chosen["dt"].strftime("%Y-%m-%d"),
+        others="\n".join("- " + o for o in others) or "(없음)")
+    data = run_gemini(key, models, prompt, valid_script)
     if not data:
         sys.exit("대본 생성에 실패했습니다. 잠시 후 다시 실행해 주세요.")
 
