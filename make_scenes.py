@@ -4,8 +4,9 @@ import json, os, re, sys, time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import requests
+from bs4 import BeautifulSoup
 
 MAX_AGE_DAYS = 7
 GROUPS = [
@@ -72,6 +73,45 @@ def collect_candidates(used):
                 break
         print(f"[{gname}] 후보 {n}개")
     return cands
+
+
+
+def fetch_article(url):
+    """사용자가 보낸 기사 링크에서 제목, 언론사, 본문을 읽어옵니다."""
+    if not re.match(r"^https?://", url):
+        raise ValueError("http(s) 링크만 사용할 수 있어요.")
+    r = requests.get(url, timeout=30, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9"})
+    r.raise_for_status()
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        r.encoding = r.apparent_encoding
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    def meta(*names):
+        for n in names:
+            tag = soup.find("meta", attrs={"property": n}) or soup.find("meta", attrs={"name": n})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return ""
+
+    title = meta("og:title", "twitter:title") or (soup.title.get_text(strip=True) if soup.title else "")
+    desc = meta("og:description", "description")
+    site = meta("og:site_name") or urlparse(r.url).netloc
+    date = (meta("article:published_time", "og:article:published_time") or "")[:10]
+    for t in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
+        t.decompose()
+    box = (soup.find("article") or soup.find(id=re.compile("article|newsct|content", re.I))
+           or soup.body or soup)
+    paras = [p.get_text(" ", strip=True) for p in box.find_all("p")]
+    body = "\n".join(p for p in paras if len(p) > 30)
+    if len(body) < 200:
+        body = (desc + "\n" + body).strip()
+    if not title and not body:
+        raise ValueError("기사 내용을 읽지 못했어요.")
+    return {"title": title, "source": site, "date": date or "날짜 미상",
+            "body": body[:6000], "url": r.url}
 
 
 def list_models(key):
@@ -171,6 +211,32 @@ SCRIPT_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제�
 """
 
 
+ARTICLE_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 기사 내용을 바탕으로 30초 분량의 뉴스 영상 대본을 JSON으로만 써라.
+
+[기사]
+제목: {title}
+언론사: {source} ({date})
+본문:
+{body}
+
+규칙:
+- 기사에 나온 사실만 사용한다. 숫자, 날짜, 인물, 제품명을 지어내지 않는다. 기사에 없는 내용은 쓰지 않는다.
+- 기사 문장을 그대로 옮기지 말고, 완전히 새로운 문장으로 요약해서 쓴다.
+- 추측, 과장, 광고 문구를 쓰지 않는다. 기사의 분위기를 왜곡하지 않는다.
+- 장면은 4개. 각 장면의 headline은 18자 이내, narration은 45자 이내의 자연스러운 뉴스 구어체.
+- 전체 narration 합계는 170자 안팎이다.
+- 첫 장면은 시선을 끄는 한 문장, 마지막 장면은 정리 한 문장이다.
+- 이 영상은 해당 기업의 공식 채널이 아니므로 공식 입장처럼 말하지 않는다.
+- 각 장면에 image_query를 넣는다. 그 장면에 어울리는 사진을 찾기 위한 영어 검색어 2~4단어다.
+  일반적인 장면을 묘사한다. 예: "modern kitchen appliances", "couple new home living room", "electronics store showroom".
+  브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
+- caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다.
+
+출력 형식(JSON만, 설명 금지):
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "..."}}]}}
+"""
+
+
 def valid_script(d):
     try:
         sc = d["scenes"]
@@ -198,38 +264,53 @@ def main():
         os.remove("scenes.json")  # 지난번 대본이 남아 있지 않게
     used = json.load(open("used.json", encoding="utf-8")) if os.path.exists("used.json") else []
 
-    cands = collect_candidates(used)
-    if not cands:
-        skip("최근 7일 이내의 새 기사가 없어서 이번 영상은 건너뛰었어요.")
-
     models = list_models(key)
     print("사용할 모델 순서:", models)
 
-    lines = "\n".join(
-        f"[{i}] ({c['group'] + 1}순위: {c['gname']}) {c['title']} - {c['source']} ({c['dt'].strftime('%m/%d')})"
-        for i, c in enumerate(cands))
-    sel = run_gemini(key, models, SELECT_PROMPT.format(lines=lines),
-                     lambda d: isinstance(d.get("index"), int)
-                     and -1 <= d["index"] < len(cands))
-    if sel is None:
-        sys.exit("기사 선택에 실패했습니다. 잠시 후 다시 실행해 주세요.")
-    if sel["index"] == -1:
-        skip("긍정적이고 관련 있는 새 기사가 없어서 이번 영상은 건너뛰었어요.")
-    chosen = cands[sel["index"]]
-    print("선택한 기사:", chosen["title"], "-", chosen["source"], f"({chosen['gname']})")
+    link = os.environ.get("ARTICLE_URL", "").strip()
+    if link:
+        # ---- 내가 보낸 기사 링크로 만들기 ----
+        print("링크 모드:", link)
+        try:
+            art = fetch_article(link)
+        except Exception as e:
+            skip(f"기사 링크를 읽지 못했어요 ({str(e)[:80]}). "
+                 "기사 제목과 본문을 복사해서 알려주시면 다른 방법을 찾아볼게요.")
+        print("기사 제목:", art["title"], "-", art["source"])
+        prompt = ARTICLE_PROMPT.format(title=art["title"], source=art["source"],
+                                       date=art["date"], body=art["body"] or "(본문을 읽지 못함)")
+        used_title = art["title"]
+    else:
+        # ---- 자동으로 기사 고르기 ----
+        cands = collect_candidates(used)
+        if not cands:
+            skip("최근 7일 이내의 새 기사가 없어서 이번 영상은 건너뛰었어요.")
+        lines = "\n".join(
+            f"[{i}] ({c['group'] + 1}순위: {c['gname']}) {c['title']} - {c['source']} ({c['dt'].strftime('%m/%d')})"
+            for i, c in enumerate(cands))
+        sel = run_gemini(key, models, SELECT_PROMPT.format(lines=lines),
+                         lambda d: isinstance(d.get("index"), int)
+                         and -1 <= d["index"] < len(cands))
+        if sel is None:
+            sys.exit("기사 선택에 실패했습니다. 잠시 후 다시 실행해 주세요.")
+        if sel["index"] == -1:
+            skip("긍정적이고 관련 있는 새 기사가 없어서 이번 영상은 건너뛰었어요.")
+        chosen = cands[sel["index"]]
+        print("선택한 기사:", chosen["title"], "-", chosen["source"], f"({chosen['gname']})")
+        others = [c["title"] for c in cands
+                  if c["title"] != chosen["title"] and c["group"] == chosen["group"]][:6]
+        prompt = SCRIPT_PROMPT.format(
+            title=chosen["title"], source=chosen["source"] or "언론사",
+            date=chosen["dt"].strftime("%Y-%m-%d"),
+            others="\n".join("- " + o for o in others) or "(없음)")
+        used_title = chosen["title"]
 
-    others = [c["title"] for c in cands
-              if c["title"] != chosen["title"] and c["group"] == chosen["group"]][:6]
-    prompt = SCRIPT_PROMPT.format(
-        title=chosen["title"], source=chosen["source"] or "언론사",
-        date=chosen["dt"].strftime("%Y-%m-%d"),
-        others="\n".join("- " + o for o in others) or "(없음)")
     data = run_gemini(key, models, prompt, valid_script)
     if not data:
         sys.exit("대본 생성에 실패했습니다. 잠시 후 다시 실행해 주세요.")
 
     json.dump(data, open("scenes.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    used.append(chosen["title"])
+    used.append(used_title)
     json.dump(used[-200:], open("used.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
