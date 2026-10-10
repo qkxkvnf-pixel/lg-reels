@@ -1,6 +1,6 @@
 import asyncio, json, os, random, subprocess, sys, time
 import edge_tts, requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H = 1080, 1920
 BW, BH = 1620, 2880          # 배경 사진은 1.5배 크기로 준비(확대 효과용)
@@ -69,6 +69,49 @@ def gradient_bg(path):
 _used_photo_ids = set()
 
 
+def fit_user_photo(src, dst):
+    """내가 보낸 사진을 영상 배경으로 만듭니다. 가로 사진은 흐린 배경 위에 선명하게 얹어요."""
+    im = Image.open(src).convert("RGB")
+    if im.width / im.height <= 0.9:          # 세로에 가까운 사진: 꽉 채우기
+        im.save(dst, quality=92)
+        cover_resize(dst)
+        return
+    cover = im.copy()
+    s = max(BW / cover.width, BH / cover.height)
+    cover = cover.resize((int(cover.width * s) + 1, int(cover.height * s) + 1), Image.LANCZOS)
+    x, y = (cover.width - BW) // 2, (cover.height - BH) // 2
+    bg = cover.crop((x, y, x + BW, y + BH)).filter(ImageFilter.GaussianBlur(45))
+    bg = Image.blend(bg, Image.new("RGB", (BW, BH), (0, 0, 0)), 0.35)
+    fw = BW
+    fh = int(im.height * fw / im.width)
+    fg = im.resize((fw, fh), Image.LANCZOS)
+    bg.paste(fg, (0, int(BH * 0.38) - fh // 2))
+    bg.save(dst, quality=92)
+
+
+def download_user_photos(ids):
+    """텔레그램으로 보낸 사진을 받아옵니다."""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    paths = []
+    if not token:
+        return paths
+    for i, fid in enumerate(ids[:5]):
+        try:
+            j = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                             params={"file_id": fid}, timeout=30).json()
+            fp = j["result"]["file_path"]
+            data = requests.get(f"https://api.telegram.org/file/bot{token}/{fp}", timeout=60)
+            data.raise_for_status()
+            raw = f"{OUT}/user_raw{i}"
+            open(raw, "wb").write(data.content)
+            Image.open(raw).verify()              # 사진이 맞는지 확인
+            paths.append(raw)
+        except Exception as e:
+            print("내 사진 받기 실패:", str(e)[:100])
+    print(f"내 사진 {len(paths)}장 사용")
+    return paths
+
+
 def _download(url, path):
     img = requests.get(url, timeout=60)
     img.raise_for_status()
@@ -77,7 +120,7 @@ def _download(url, path):
 
 
 def fetch_pixabay(query, path):
-    """Pixabay(무료)에서 세로 사진을 가져옵니다."""
+    """Pixabay(무료)에서 검색어와 가장 잘 맞는 세로 사진을 가져옵니다."""
     key = os.environ.get("PIXABAY_API_KEY")
     if not key:
         return False
@@ -93,7 +136,15 @@ def fetch_pixabay(query, path):
             break
     if not hits:
         return False
-    h = random.choice(hits[:8])
+    words = [w for w in query.lower().split() if len(w) > 2]
+
+    def score(h):   # 사진 태그에 검색어 단어가 많이 들어 있을수록 내용과 잘 맞음
+        tags = str(h.get("tags", "")).lower()
+        return sum(1 for w in words if w in tags)
+
+    top = sorted(hits[:12], key=score, reverse=True)
+    best = [h for h in top if score(h) == score(top[0])][:4]
+    h = random.choice(best)
     _used_photo_ids.add(("px", h["id"]))
     _download(h.get("largeImageURL") or h["webformatURL"], path)
     return True
@@ -118,16 +169,17 @@ def fetch_pexels(query, path):
     return True
 
 
-def fetch_photo(query, path):
-    """성공하면 사진 출처 이름('Pixabay' 등)을, 실패하면 None을 돌려줍니다."""
-    if not query:
-        return None
-    for name, fn in (("Pixabay", fetch_pixabay), ("Pexels", fetch_pexels)):
-        try:
-            if fn(query, path):
-                return name
-        except Exception as e:
-            print(f"{name} 사진 실패:", query, str(e)[:120])
+def fetch_photo(queries, path):
+    """검색어를 순서대로 시도합니다. 성공하면 사진 출처 이름을, 실패하면 None을 돌려줍니다."""
+    if isinstance(queries, str):
+        queries = [queries]
+    for q in [x for x in queries if x]:
+        for name, fn in (("Pixabay", fetch_pixabay), ("Pexels", fetch_pexels)):
+            try:
+                if fn(q, path):
+                    return name
+            except Exception as e:
+                print(f"{name} 사진 실패:", q, str(e)[:120])
     return None
 
 
@@ -186,11 +238,12 @@ def duration(path):
     return float(r.stdout.strip())
 
 
-def make_clip(bg, overlay, mp3, mp4, dur, zoom_in):
+def make_clip(bg, overlay, mp3, mp4, dur, zoom_in, pan=0):
     """사진을 천천히 확대/축소하면서 뉴스 화면을 얹고 음성을 붙입니다."""
     frames = int(dur * 30) + 3
     z = ("min(1.0+0.0006*on,1.15)" if zoom_in else "max(1.0,1.15-0.0006*on)")
-    fc = (f"[0:v]zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+    xs = ["iw/2-(iw/zoom/2)", "(iw-iw/zoom)*0.2", "(iw-iw/zoom)*0.8"][pan % 3]
+    fc = (f"[0:v]zoompan=z='{z}':x='{xs}':y='ih/2-(ih/zoom/2)'"
           f":d={frames}:s={W}x{H}:fps=30[bg];"
           f"[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]")
     run(["ffmpeg", "-y", "-i", bg, "-loop", "1", "-framerate", "30", "-i", overlay,
@@ -211,17 +264,23 @@ def main():
     data = json.load(open("scenes.json", encoding="utf-8"))
     scenes = data["scenes"]
     clips, credits = [], set()
+    ids = [x.strip() for x in os.environ.get("PHOTO_IDS", "").split(",") if x.strip()]
+    mine = download_user_photos(ids) if ids else []
     for i, s in enumerate(scenes):
         bg = f"{OUT}/bg{i}.jpg"
         ov, mp3, mp4 = f"{OUT}/ov{i}.png", f"{OUT}/s{i}.mp3", f"{OUT}/s{i}.mp4"
-        src = fetch_photo(s.get("image_query"), bg)
-        if src:
-            credits.add(src)
+        if mine:
+            fit_user_photo(mine[i % len(mine)], bg)           # 내가 보낸 사진
         else:
-            gradient_bg(bg)
+            src = fetch_photo([s.get("image_query"), s.get("image_query_alt"),
+                               "home appliances"], bg)
+            if src:
+                credits.add(src)
+            else:
+                gradient_bg(bg)
         render_overlay(s["headline"], s["narration"], i, len(scenes), ov)
         asyncio.run(tts(s["narration"], mp3))
-        make_clip(bg, ov, mp3, mp4, duration(mp3) + 0.4, zoom_in=(i % 2 == 0))
+        make_clip(bg, ov, mp3, mp4, duration(mp3) + 0.4, zoom_in=(i % 2 == 0), pan=i)
         clips.append(mp4)
     with open(f"{OUT}/list.txt", "w") as f:
         for c in clips:
