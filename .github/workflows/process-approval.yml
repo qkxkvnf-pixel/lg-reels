@@ -1,0 +1,35 @@
+name: process-approval
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "ok(승인) 또는 no(거절)"
+        required: true
+      tag:
+        description: "영상 이름"
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: process-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: 승인 처리 (인스타 업로드 또는 삭제)
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TAG: ${{ github.event.inputs.tag }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_PAGE_TOKEN: ${{ secrets.IG_PAGE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: python approve.py
