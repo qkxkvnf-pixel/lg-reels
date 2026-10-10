@@ -6,6 +6,10 @@ on:
         description: "기사 링크 (비워두면 자동으로 기사를 고릅니다)"
         required: false
         default: ""
+      photos:
+        description: "내 사진 (자동 입력용, 직접 쓰지 않아도 돼요)"
+        required: false
+        default: ""
   schedule:
     - cron: "0 2,6,11 * * *"   # 매일 한국시간 11:00, 15:00, 20:00
 permissions:
@@ -31,11 +35,13 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ARTICLE_URL: ${{ github.event.inputs.url }}
+          PHOTO_IDS: ${{ github.event.inputs.photos }}
         run: python make_scenes.py
       - name: 영상 만들고 승인 요청 보내기
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PHOTO_IDS: ${{ github.event.inputs.photos }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           GH_TOKEN: ${{ github.token }}
