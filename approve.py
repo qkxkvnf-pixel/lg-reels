@@ -1,4 +1,6 @@
-"""텔레그램 승인/거절 버튼을 확인하고, 승인된 영상을 인스타 릴스로 올립니다."""
+"""버튼으로 승인/거절된 영상을 처리합니다. (인스타 업로드 또는 삭제)
+- 승인/거절 버튼은 Cloudflare 가 받아서 이 프로그램을 바로 실행시켜 줍니다.
+- 하루 한 번은 3일 넘게 방치된 임시 영상을 지웁니다."""
 import json, os, re, subprocess, sys, time
 from datetime import datetime, timezone
 import requests
@@ -10,6 +12,7 @@ IG_TOKEN = os.environ.get("IG_PAGE_TOKEN", "")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TG = f"https://api.telegram.org/bot{TOKEN}"
 GV = "v26.0"
+TAG_RE = re.compile(r"^p\d{8}-\d{6}$")
 
 
 def tg(method, **data):
@@ -83,32 +86,18 @@ def buttons(tag):
         {"text": "❌ 거절", "callback_data": f"no:{tag}"}]]})
 
 
-def handle(cq):
-    cqid = cq["id"]
-    if str(cq["from"]["id"]) != CHAT:
-        tg("answerCallbackQuery", callback_query_id=cqid, text="권한이 없습니다.")
-        return
-    action, tag = cq["data"].split(":", 1)
-    mid = cq["message"]["message_id"]
+def process(action, tag):
     exists = gh("release", "view", tag, "--json", "body", "-q", ".body", check=False)
     if exists.returncode != 0:
-        tg("answerCallbackQuery", callback_query_id=cqid, text="이미 처리된 영상입니다.")
-        tg("editMessageReplyMarkup", chat_id=CHAT, message_id=mid,
-           reply_markup=json.dumps({"inline_keyboard": []}))
+        tg("sendMessage", chat_id=CHAT, text="ℹ️ 이미 처리된 영상이에요.")
         return
     caption = exists.stdout.strip()
 
     if action == "no":
         gh("release", "delete", tag, "--cleanup-tag", "-y", check=False)
-        tg("answerCallbackQuery", callback_query_id=cqid, text="거절했어요.")
-        tg("editMessageReplyMarkup", chat_id=CHAT, message_id=mid,
-           reply_markup=json.dumps({"inline_keyboard": []}))
         tg("sendMessage", chat_id=CHAT, text="❌ 거절된 영상을 삭제했어요.")
         return
 
-    tg("answerCallbackQuery", callback_query_id=cqid, text="업로드를 시작합니다.")
-    tg("editMessageReplyMarkup", chat_id=CHAT, message_id=mid,
-       reply_markup=json.dumps({"inline_keyboard": []}))
     try:
         if not (IG_USER and IG_TOKEN):
             raise RuntimeError("IG_USER_ID / IG_PAGE_TOKEN 이 설정되지 않았어요.")
@@ -124,35 +113,6 @@ def handle(cq):
            reply_markup=buttons(tag))
 
 
-_help_sent = False
-
-
-def handle_message(m):
-    """내가 텔레그램으로 보낸 기사 링크를 받아 영상 제작을 시작합니다."""
-    global _help_sent
-    if str(m.get("chat", {}).get("id")) != CHAT:
-        return
-    if time.time() - m.get("date", 0) > 3600:      # 오래된 메시지는 무시
-        return
-    text = m.get("text") or ""
-    urls = re.findall(r"https?://[^\s<>\"']+", text)[:3]
-    if not urls:
-        if not _help_sent:
-            _help_sent = True
-            tg("sendMessage", chat_id=CHAT,
-               text="📎 영상으로 만들 기사 링크를 보내주세요.\n링크를 받으면 영상을 만들어 승인 요청을 보내드려요.")
-        return
-    for u in urls:
-        r = gh("workflow", "run", "make-video.yml", "-f", f"url={u}", check=False)
-        if r.returncode == 0:
-            tg("sendMessage", chat_id=CHAT,
-               text="🔗 링크를 받았어요. 영상을 만드는 중이에요 (약 5~10분).\n완성되면 승인 버튼과 함께 보내드릴게요.")
-        else:
-            print("실행 실패:", r.stderr[:300])
-            tg("sendMessage", chat_id=CHAT,
-               text="⚠️ 영상 제작을 시작하지 못했어요. 잠시 후 링크를 다시 보내주세요.")
-
-
 def cleanup_old():
     """3일 넘게 방치된 임시 영상은 자동으로 지웁니다."""
     r = gh("release", "list", "--json", "tagName,createdAt", check=False)
@@ -160,7 +120,7 @@ def cleanup_old():
         return
     now = datetime.now(timezone.utc)
     for it in json.loads(r.stdout or "[]"):
-        if not it["tagName"].startswith("p"):
+        if not TAG_RE.match(it["tagName"]):
             continue
         t = datetime.fromisoformat(it["createdAt"].replace("Z", "+00:00"))
         if (now - t).days >= 3:
@@ -169,21 +129,14 @@ def cleanup_old():
 
 
 def main():
-    r = requests.get(f"{TG}/getUpdates",
-                     params={"timeout": 0, "allowed_updates": json.dumps(["callback_query", "message"])},
-                     timeout=60).json()
-    ups = r.get("result", [])
-    if ups:
-        last = max(u["update_id"] for u in ups)
-        # 같은 버튼을 두 번 처리하지 않도록 먼저 '읽음' 처리
-        requests.get(f"{TG}/getUpdates", params={"offset": last + 1, "timeout": 0}, timeout=60)
-        for u in ups:
-            if "callback_query" in u:
-                handle(u["callback_query"])
-            elif "message" in u:
-                handle_message(u["message"])
+    action = os.environ.get("ACTION", "").strip()
+    tag = os.environ.get("TAG", "").strip()
+    if action in ("ok", "no"):
+        if not TAG_RE.match(tag):
+            sys.exit("잘못된 영상 이름입니다: " + tag)
+        process(action, tag)
     else:
-        print("새 버튼 입력 없음")
+        print("정리 작업만 실행합니다.")
     cleanup_old()
 
 
