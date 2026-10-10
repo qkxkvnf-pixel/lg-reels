@@ -1,4 +1,4 @@
-import asyncio, json, os, random, subprocess, sys, time
+import asyncio, base64, json, os, random, re, subprocess, sys, time
 import edge_tts, requests
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -183,6 +183,93 @@ def fetch_photo(queries, path):
     return None
 
 
+# ---------------- AI 이미지 생성 (Gemini) ----------------
+AI_STYLE = ("Clean modern semi-realistic 3D illustration, soft natural lighting, "
+            "warm bright colors, shallow depth of field")
+AI_RULES = ("Vertical 9:16 composition. Main subject in the upper-middle of the frame, "
+            "simple calm area in the lower third. No text, no letters, no logos, "
+            "no brand names, no real people, no watermarks.")
+_GAPI = "https://generativelanguage.googleapis.com/v1beta"
+_ai_models = None
+_ai_off = False
+
+
+def list_image_models(key):
+    """쓸 수 있는 Gemini 이미지 모델을 좋은 순서로 찾습니다."""
+    forced = os.environ.get("GEMINI_IMAGE_MODEL")
+    if forced:
+        return [forced]
+    r = requests.get(f"{_GAPI}/models", params={"key": key, "pageSize": 200}, timeout=30)
+    r.raise_for_status()
+    flash, other = [], []
+    for m in r.json().get("models", []):
+        name = m["name"].split("/")[-1]
+        if ("generateContent" not in m.get("supportedGenerationMethods", [])
+                or "image" not in name or "imagen" in name or "pro" in name):
+            continue
+        ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        item = (float(ver.group(1)) if ver else 0, "preview" not in name, name)
+        (flash if "flash" in name else other).append(item)
+    return [n for _, _, n in sorted(flash, reverse=True)] + \
+           [n for _, _, n in sorted(other, reverse=True)]
+
+
+def _extract_image(resp_json):
+    for cand in resp_json.get("candidates", []):
+        for p in cand.get("content", {}).get("parts", []):
+            d = p.get("inlineData") or p.get("inline_data")
+            if d and d.get("data"):
+                return base64.b64decode(d["data"])
+    return None
+
+
+def generate_ai_image(image_prompt, path):
+    """장면 설명으로 AI 그림을 만듭니다. 실패하면 False (그러면 무료 사진으로 대체)."""
+    global _ai_models, _ai_off
+    key = os.environ.get("GEMINI_API_KEY")
+    if _ai_off or not key or not image_prompt:
+        return False
+    try:
+        if _ai_models is None:
+            _ai_models = list_image_models(key)
+            print("이미지 모델 순서:", _ai_models)
+        prompt = f"{AI_STYLE}. {image_prompt}. {AI_RULES}"
+        hard = False
+        for model in _ai_models[:3]:
+            for use_ratio in (True, False):
+                cfg = {"responseModalities": ["TEXT", "IMAGE"]}
+                if use_ratio:
+                    cfg["imageConfig"] = {"aspectRatio": "9:16"}
+                r = requests.post(
+                    f"{_GAPI}/models/{model}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": cfg}, timeout=120)
+                if r.status_code == 200:
+                    raw = _extract_image(r.json())
+                    if raw:
+                        open(path, "wb").write(raw)
+                        cover_resize(path)
+                        return True
+                    print("AI가 그림을 돌려주지 않았어요(안전 규칙 등):", model)
+                    break
+                msg = r.text[:200].replace("\n", " ")
+                print(f"AI 이미지 오류 {r.status_code} ({model}):", msg)
+                if r.status_code == 400 and use_ratio:
+                    continue                     # 비율 설정 없이 한 번 더
+                if r.status_code in (401, 403, 429):
+                    hard = True                  # 무료 한도/권한 문제 → 다음 모델
+                break
+        # 한도/권한 문제로 막혔다면 이번 실행에서는 AI 이미지를 더 시도하지 않음
+        # (그림 하나가 안전 규칙으로 거절된 경우는 그 장면만 무료 사진으로 대체)
+        if hard:
+            _ai_off = True
+    except Exception as e:
+        print("AI 이미지 실패:", str(e)[:150])
+        _ai_off = True
+    return False
+
+
 def render_overlay(headline, narration, idx, total, path):
     """사진 위에 얹을 투명한 뉴스 화면(상단 바, 헤드라인, 자막)."""
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -266,11 +353,14 @@ def main():
     clips, credits = [], set()
     ids = [x.strip() for x in os.environ.get("PHOTO_IDS", "").split(",") if x.strip()]
     mine = download_user_photos(ids) if ids else []
+    ai_on = os.environ.get("AI_IMAGES", "0") == "1" and bool(os.environ.get("GEMINI_API_KEY"))
     for i, s in enumerate(scenes):
         bg = f"{OUT}/bg{i}.jpg"
         ov, mp3, mp4 = f"{OUT}/ov{i}.png", f"{OUT}/s{i}.mp3", f"{OUT}/s{i}.mp4"
         if mine:
             fit_user_photo(mine[i % len(mine)], bg)           # 내가 보낸 사진
+        elif ai_on and generate_ai_image(s.get("image_prompt"), bg):
+            credits.add("AI")                                  # AI가 만든 그림
         else:
             src = fetch_photo([s.get("image_query"), s.get("image_query_alt"),
                                "home appliances"], bg)
@@ -292,8 +382,14 @@ def main():
     print("영상 완성:", final, f"({duration(final):.1f}초)")
 
     caption = data.get("caption", "")
-    if credits:
-        caption += "\n사진: " + ", ".join(sorted(credits))
+    notes = []
+    if "AI" in credits:
+        notes.append("이미지: AI 생성")
+    stock = sorted(credits - {"AI"})
+    if stock:
+        notes.append("사진: " + ", ".join(stock))
+    if notes:
+        caption += "\n" + "\n".join(notes)
 
     token = os.environ.get("TELEGRAM_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
