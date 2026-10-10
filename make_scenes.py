@@ -254,11 +254,13 @@ SCRIPT_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제�
   예: 매장 오픈이면 "electronics store interior", 행사면 "promotion event booth customers", 혼수 소식이면 "newlywed couple shopping appliances", 세탁기 이야기면 "washing machine laundry room".
   image_query_alt는 1~2단어의 더 일반적인 대체 검색어다. 예: "home appliances".
   브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
+- 각 장면에 image_prompt도 넣는다. AI 그림 생성용 영어 설명 한 문장(20~35단어)이다. 그 장면의 내용을 시각적으로 구체적으로 묘사한다(장소, 사물, 분위기). 사람이 나오면 뒷모습이나 작은 실루엣 정도로만 한다.
+  브랜드명, 로고, 글자, 실존 인물은 넣지 않는다. 화면 위쪽 중앙에 중심 대상이 오고, 아래쪽은 단순하게 한다.
 - 제목에 나온 지역(예: 안양, 인천)을 첫 장면과 마지막 장면에서 자연스럽게 언급한다.
 - caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다. 해시태그 중 2개는 기사의 지역과 관련된 것(예: #안양, #인천베스트샵)으로 한다.
 
 출력 형식(JSON만, 설명 금지):
-{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "..."}}]}}
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "...", "image_prompt": "..."}}]}}
 """
 
 
@@ -287,10 +289,13 @@ ARTICLE_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 기사 내�
   예: 매장 오픈이면 "electronics store interior", 행사면 "promotion event booth customers", 혼수 소식이면 "newlywed couple shopping appliances", 세탁기 이야기면 "washing machine laundry room".
   image_query_alt는 1~2단어의 더 일반적인 대체 검색어다. 예: "home appliances".
   브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
+- 각 장면에 image_prompt도 넣는다. AI 그림 생성용 영어 설명 한 문장(20~35단어)이다. 그 장면의 내용을 시각적으로 구체적으로 묘사한다(장소, 사물, 분위기). 사람이 나오면 뒷모습이나 작은 실루엣 정도로만 한다.
+  브랜드명, 로고, 글자, 실존 인물은 넣지 않는다. 화면 위쪽 중앙에 중심 대상이 오고, 아래쪽은 단순하게 한다.
+  기사 대표 사진 설명이 있으면, 비슷한 장소와 분위기로 묘사한다.
 - caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다.
 
 출력 형식(JSON만, 설명 금지):
-{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "..."}}]}}
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "...", "image_prompt": "..."}}]}}
 """
 
 
