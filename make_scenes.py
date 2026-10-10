@@ -1,10 +1,10 @@
 """고양·안양·인천·시흥 지역의 최근 7일 이내 긍정적인 베스트샵·가전 행사 뉴스를 골라
 30초 뉴스 대본(scenes.json)을 만듭니다."""
-import json, os, re, sys, time
+import base64, json, os, re, sys, time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 
@@ -116,6 +116,8 @@ def fetch_article(url):
     desc = meta("og:description", "description")
     site = meta("og:site_name") or urlparse(r.url).netloc
     date = (meta("article:published_time", "og:article:published_time") or "")[:10]
+    image = meta("og:image", "twitter:image")
+    image = urljoin(r.url, image) if image else ""
     for t in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
         t.decompose()
     box = (soup.find("article") or soup.find(id=re.compile("article|newsct|content", re.I))
@@ -127,7 +129,32 @@ def fetch_article(url):
     if not title and not body:
         raise ValueError("기사 내용을 읽지 못했어요.")
     return {"title": title, "source": site, "date": date or "날짜 미상",
-            "body": body[:6000], "url": r.url}
+            "body": body[:6000], "url": r.url, "image": image}
+
+
+def describe_image(key, models, img_url):
+    """기사 대표 사진을 AI가 '보고' 영어로 간단히 설명합니다. (사진 자체는 영상에 쓰지 않아요.)"""
+    if not img_url:
+        return ""
+    try:
+        r = requests.get(img_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        mime = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        if not mime.startswith("image/") or len(r.content) > 4_000_000:
+            return ""
+        img = (mime, base64.b64encode(r.content).decode())
+    except Exception as e:
+        print("기사 사진을 받지 못했어요:", str(e)[:100])
+        return ""
+    prompt = ("이 뉴스 사진에 무엇이 있는지 영어로 한두 문장으로 설명하라. "
+              "장소 종류(매장 내부, 매장 외관, 행사장, 야외 등), 분위기, 주요 사물(가전 종류 등), "
+              "사람 수와 활동만 쓴다. 사람의 얼굴이나 이름은 알아보려고 하지 않는다. "
+              'JSON만: {"description": "..."}')
+    d = run_gemini(key, models[:3], prompt,
+                   lambda x: isinstance(x.get("description"), str), image=img)
+    desc = (d or {}).get("description", "").strip()
+    print("기사 사진 분석:", desc)
+    return desc[:300]
 
 
 def list_models(key):
@@ -154,11 +181,12 @@ def list_models(key):
     return ordered[:5]
 
 
-def ask_gemini(key, model, prompt):
+def ask_gemini(key, model, prompt, image=None):
     r = requests.post(
         f"{API}/models/{model}:generateContent",
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}],
+        json={"contents": [{"parts": ([{"inline_data": {"mime_type": image[0], "data": image[1]}}]
+                                       if image else []) + [{"text": prompt}]}],
               "generationConfig": {"responseMimeType": "application/json",
                                    "temperature": 0.5}},
         timeout=60)
@@ -169,13 +197,13 @@ def ask_gemini(key, model, prompt):
     return json.loads(text.replace("```json", "").replace("```", "").strip())
 
 
-def run_gemini(key, models, prompt, check):
+def run_gemini(key, models, prompt, check, image=None):
     """모델을 바꿔가며, 점점 길게 기다리며 재시도합니다."""
     for model in models:
         for attempt in range(3):
             try:
                 print(f"시도: {model} ({attempt + 1}/3)")
-                d = ask_gemini(key, model, prompt)
+                d = ask_gemini(key, model, prompt, image)
                 if check(d):
                     return d
                 print("형식이 맞지 않아 다시 시도합니다.")
@@ -221,14 +249,16 @@ SCRIPT_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제�
 - 전체 narration 합계는 170자 안팎이다.
 - 첫 장면은 시선을 끄는 한 문장, 마지막 장면은 정리 한 문장이다.
 - 이 영상은 LG전자 공식 채널이 아니므로 공식 입장처럼 말하지 않는다.
-- 각 장면에 image_query를 넣는다. 그 장면에 어울리는 사진을 찾기 위한 영어 검색어 2~4단어다.
-  일반적인 장면을 묘사한다. 예: "modern kitchen appliances", "couple new home living room", "washing machine laundry room", "electronics store showroom".
+- 각 장면에 image_query와 image_query_alt를 넣는다. 그 장면의 내용에 딱 맞는 사진을 찾기 위한 영어 검색어다.
+  image_query는 2~4단어로 구체적으로 쓴다. 장면이 말하는 장소와 사물에 맞춘다.
+  예: 매장 오픈이면 "electronics store interior", 행사면 "promotion event booth customers", 혼수 소식이면 "newlywed couple shopping appliances", 세탁기 이야기면 "washing machine laundry room".
+  image_query_alt는 1~2단어의 더 일반적인 대체 검색어다. 예: "home appliances".
   브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
 - 제목에 나온 지역(예: 안양, 인천)을 첫 장면과 마지막 장면에서 자연스럽게 언급한다.
 - caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다. 해시태그 중 2개는 기사의 지역과 관련된 것(예: #안양, #인천베스트샵)으로 한다.
 
 출력 형식(JSON만, 설명 금지):
-{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "..."}}]}}
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "..."}}]}}
 """
 
 
@@ -240,6 +270,9 @@ ARTICLE_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 기사 내�
 본문:
 {body}
 
+[기사 대표 사진 설명]
+{photo_desc}
+
 규칙:
 - 기사에 나온 사실만 사용한다. 숫자, 날짜, 인물, 제품명을 지어내지 않는다. 기사에 없는 내용은 쓰지 않는다.
 - 기사 문장을 그대로 옮기지 말고, 완전히 새로운 문장으로 요약해서 쓴다.
@@ -248,13 +281,16 @@ ARTICLE_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 기사 내�
 - 전체 narration 합계는 170자 안팎이다.
 - 첫 장면은 시선을 끄는 한 문장, 마지막 장면은 정리 한 문장이다.
 - 이 영상은 해당 기업의 공식 채널이 아니므로 공식 입장처럼 말하지 않는다.
-- 각 장면에 image_query를 넣는다. 그 장면에 어울리는 사진을 찾기 위한 영어 검색어 2~4단어다.
-  일반적인 장면을 묘사한다. 예: "modern kitchen appliances", "couple new home living room", "electronics store showroom".
+- 각 장면에 image_query와 image_query_alt를 넣는다. 그 장면의 내용에 딱 맞는 사진을 찾기 위한 영어 검색어다.
+  기사 대표 사진 설명이 있으면, 그 사진과 비슷한 장소·분위기·사물이 나오는 사진을 찾도록 검색어를 정한다.
+  image_query는 2~4단어로 구체적으로 쓴다. 장면이 말하는 장소와 사물에 맞춘다.
+  예: 매장 오픈이면 "electronics store interior", 행사면 "promotion event booth customers", 혼수 소식이면 "newlywed couple shopping appliances", 세탁기 이야기면 "washing machine laundry room".
+  image_query_alt는 1~2단어의 더 일반적인 대체 검색어다. 예: "home appliances".
   브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
 - caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다.
 
 출력 형식(JSON만, 설명 금지):
-{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "..."}}]}}
+{{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "...", "image_query_alt": "..."}}]}}
 """
 
 
@@ -298,8 +334,12 @@ def main():
             skip(f"기사 링크를 읽지 못했어요 ({str(e)[:80]}). "
                  "기사 제목과 본문을 복사해서 알려주시면 다른 방법을 찾아볼게요.")
         print("기사 제목:", art["title"], "-", art["source"])
+        photo_desc = ""
+        if not os.environ.get("PHOTO_IDS", "").strip():       # 내 사진이 없을 때만 분석
+            photo_desc = describe_image(key, models, art.get("image"))
         prompt = ARTICLE_PROMPT.format(title=art["title"], source=art["source"],
-                                       date=art["date"], body=art["body"] or "(본문을 읽지 못함)")
+                                       date=art["date"], body=art["body"] or "(본문을 읽지 못함)",
+                                       photo_desc=photo_desc or "(사진 정보 없음)")
         used_title = art["title"]
     else:
         # ---- 자동으로 기사 고르기 ----
