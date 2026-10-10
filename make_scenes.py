@@ -1,5 +1,5 @@
-"""최근 7일 이내의 긍정적인 가전 뉴스를 골라 30초 뉴스 대본(scenes.json)을 만듭니다.
-우선순위: 1) LG전자 베스트샵  2) 혼수 가전  3) LG전자 가전 신제품"""
+"""고양·안양·인천·시흥 지역의 최근 7일 이내 긍정적인 베스트샵·가전 행사 뉴스를 골라
+30초 뉴스 대본(scenes.json)을 만듭니다."""
 import json, os, re, sys, time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -9,10 +9,24 @@ import requests
 from bs4 import BeautifulSoup
 
 MAX_AGE_DAYS = 7
+
+# ====== 지역 설정 (여기만 고치면 지역을 바꿀 수 있어요) ======
+REGIONS = ["고양", "안양", "인천", "시흥"]
+# 제목에 이 글자 중 하나는 들어 있어야 후보가 됩니다 (동네 이름 포함)
+REGION_KEYWORDS = ["고양", "일산", "덕양", "안양", "평촌", "범계",
+                   "인천", "부평", "계양", "검단", "시흥", "배곧", "정왕"]
+ALIASES = "일산 OR 덕양 OR 평촌 OR 범계 OR 부평 OR 계양 OR 검단 OR 배곧 OR 정왕"
+ALL = "(" + " OR ".join(REGIONS) + ")"
+
 GROUPS = [
-    ("LG전자 베스트샵", ["LG전자 베스트샵", "LG베스트샵"]),
-    ("혼수 가전", ["혼수 가전 LG전자", "혼수 가전 트렌드", "혼수 가전"]),
-    ("LG전자 가전 신제품", ["LG전자 가전 신제품", "LG전자 신제품 출시"]),
+    # 1순위: 해당 지역의 LG전자 베스트샵 매장·행사 소식
+    ("지역 베스트샵 매장·행사",
+     [f"LG전자 베스트샵 {r}" for r in REGIONS]
+     + [f"베스트샵 ({ALIASES})", f"LG베스트샵 {ALL} 행사"]),
+    # 2순위: 해당 지역의 혼수 가전·LG전자 행사 소식
+    ("지역 혼수 가전·행사",
+     [f"{r} 혼수 가전" for r in REGIONS]
+     + [f"{ALL} 혼수 가전 행사", f"{ALL} LG전자 행사"]),
 ]
 API = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -64,12 +78,14 @@ def collect_candidates(used):
         for it in pool:
             if it["dt"] < limit or it["title"] in used or it["title"] in seen:
                 continue
+            if not any(k in it["title"] for k in REGION_KEYWORDS):
+                continue   # 대상 지역이 제목에 없으면 제외
             seen.add(it["title"])
             it["group"] = gi
             it["gname"] = gname
             cands.append(it)
             n += 1
-            if n >= 7:
+            if n >= 8:
                 break
         print(f"[{gname}] 후보 {n}개")
     return cands
@@ -169,15 +185,19 @@ def run_gemini(key, models, prompt, check):
     return None
 
 
-SELECT_PROMPT = """너는 뉴스 편집자다. 아래 후보 기사 제목 중 영상으로 만들 기사 한 개를 골라라.
+SELECT_PROMPT = """너는 지역 뉴스 편집자다. 아래 후보 기사 제목 중 영상으로 만들 기사 한 개를 골라라.
+
+대상 지역은 경기 고양시, 경기 안양시, 인천시, 경기 시흥시 네 곳이다. (고양의 일산·덕양, 안양의 평촌·범계, 인천의 부평·계양·검단, 시흥의 배곧·정왕 같은 동네 포함)
 
 선택 기준 (중요한 순서):
-1. 긍정적이거나 호의적인 소식만 고른다. 예: 신제품 출시, 매장 오픈·리뉴얼, 수상, 고객 혜택·행사, 판매 호조, 트렌드 확산.
-   리콜, 결함, 사고, 소송, 논란, 파업, 실적 악화, 가격 인상, 불매, 안전·품질 문제, 경쟁사 비교 비판 등 부정적 소식은 반드시 제외한다.
-2. 주제 우선순위: (1순위) LG전자 베스트샵 관련 → (2순위) 혼수 가전 관련 → (3순위) LG전자 가전 신제품.
+1. 지역 조건: 제목에 대상 지역이 분명히 나오고, 그 지역의 매장이나 행사 소식이어야 한다.
+   대구, 부산, 대전, 광주, 서울 등 다른 지역 소식, 지역이 불분명한 기사, 전국 단위 기사(전국 매장, 전국 행사, 전국 동시 진행 등)는 반드시 제외한다.
+   제목에 대상 지역과 다른 지역이 함께 나오더라도 대상 지역이 중심이 아니면 제외한다.
+2. 긍정적이거나 호의적인 소식만 고른다. 예: 매장 오픈·리뉴얼, 행사·체험·프로모션, 고객 혜택, 수상, 신제품 전시, 혼수 가전 상담·행사.
+   리콜, 결함, 사고, 소송, 논란, 파업, 실적 악화, 가격 인상, 불매, 안전·품질 문제 등 부정적 소식은 반드시 제외한다.
+3. 주제 우선순위: (1순위) LG전자 베스트샵 매장·행사 → (2순위) 해당 지역의 혼수 가전·LG전자 행사.
    높은 순위에 적합한 기사가 있으면 반드시 그 기사를 고른다.
-3. 제목이 LG전자 또는 베스트샵 또는 혼수 가전과 실제로 관련이 없으면 제외한다.
-4. 기준에 맞는 기사가 하나도 없으면 -1을 답한다.
+4. 위 조건에 맞는 기사가 하나도 없으면 -1을 답한다. 억지로 고르지 않는다.
 
 후보:
 {lines}
@@ -204,7 +224,8 @@ SCRIPT_PROMPT = """너는 한국어 뉴스 쇼츠 작가다. 아래 뉴스 제�
 - 각 장면에 image_query를 넣는다. 그 장면에 어울리는 사진을 찾기 위한 영어 검색어 2~4단어다.
   일반적인 장면을 묘사한다. 예: "modern kitchen appliances", "couple new home living room", "washing machine laundry room", "electronics store showroom".
   브랜드명, 글자, 특정 인물 이름은 넣지 않는다. 장면마다 서로 다른 검색어를 쓴다.
-- caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다.
+- 제목에 나온 지역(예: 안양, 인천)을 첫 장면과 마지막 장면에서 자연스럽게 언급한다.
+- caption에는 한 줄 요약, 줄바꿈, "출처: {source}", "AI로 제작된 영상입니다", 해시태그 5개를 넣는다. 해시태그 중 2개는 기사의 지역과 관련된 것(예: #안양, #인천베스트샵)으로 한다.
 
 출력 형식(JSON만, 설명 금지):
 {{"caption": "...", "scenes": [{{"headline": "...", "narration": "...", "image_query": "..."}}]}}
@@ -284,7 +305,7 @@ def main():
         # ---- 자동으로 기사 고르기 ----
         cands = collect_candidates(used)
         if not cands:
-            skip("최근 7일 이내의 새 기사가 없어서 이번 영상은 건너뛰었어요.")
+            skip("고양·안양·인천·시흥 지역의 최근 7일 이내 새 기사가 없어서 이번 영상은 건너뛰었어요.")
         lines = "\n".join(
             f"[{i}] ({c['group'] + 1}순위: {c['gname']}) {c['title']} - {c['source']} ({c['dt'].strftime('%m/%d')})"
             for i, c in enumerate(cands))
@@ -294,7 +315,7 @@ def main():
         if sel is None:
             sys.exit("기사 선택에 실패했습니다. 잠시 후 다시 실행해 주세요.")
         if sel["index"] == -1:
-            skip("긍정적이고 관련 있는 새 기사가 없어서 이번 영상은 건너뛰었어요.")
+            skip("지역(고양·안양·인천·시흥)에 맞는 긍정적인 새 기사가 없어서 이번 영상은 건너뛰었어요.")
         chosen = cands[sel["index"]]
         print("선택한 기사:", chosen["title"], "-", chosen["source"], f"({chosen['gname']})")
         others = [c["title"] for c in cands
