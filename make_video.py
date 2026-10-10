@@ -223,8 +223,8 @@ def _extract_image(resp_json):
     return None
 
 
-def generate_ai_image(image_prompt, path):
-    """장면 설명으로 AI 그림을 만듭니다. 실패하면 False (그러면 무료 사진으로 대체)."""
+def _gemini_image(image_prompt, path):
+    """(선택) Gemini 로 그림을 만듭니다. 무료 한도가 없어서 기본은 꺼져 있어요."""
     global _ai_models, _ai_off
     key = os.environ.get("GEMINI_API_KEY")
     if _ai_off or not key or not image_prompt:
@@ -249,7 +249,7 @@ def generate_ai_image(image_prompt, path):
                     raw = _extract_image(r.json())
                     if raw:
                         open(path, "wb").write(raw)
-                        cover_resize(path)
+                        fit_user_photo(path, path)
                         return True
                     print("AI가 그림을 돌려주지 않았어요(안전 규칙 등):", model)
                     break
@@ -267,6 +267,66 @@ def generate_ai_image(image_prompt, path):
     except Exception as e:
         print("AI 이미지 실패:", str(e)[:150])
         _ai_off = True
+    return False
+
+
+# ---------------- Cloudflare Workers AI (무료 하루 10,000 Neurons) ----------------
+CF_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+# FLUX 는 '~하지 마'라는 문장을 잘 못 알아들어서, 원하는 모습만 긍정문으로 적어요
+FLUX_RULES = ("Vertical composition, the main subject centered in the upper-middle of the frame, "
+              "calm simple empty space in the lower third, soft warm lighting, clean and tidy scene.")
+_cf_off = False
+
+
+def _cf_image(image_prompt, path):
+    global _cf_off
+    acct = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    tok = os.environ.get("CLOUDFLARE_API_TOKEN")
+    if _cf_off or not (acct and tok):
+        return False
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_MODEL}"
+    prompt = f"{AI_STYLE}. {image_prompt}. {FLUX_RULES}"
+    try:
+        for size in ((1024, 1792), (768, 1344), None):      # 큰 세로 → 작은 세로 → 기본(정사각)
+            body = {"prompt": prompt, "steps": 4}
+            if size:
+                body["width"], body["height"] = size
+            r = requests.post(url, headers={"Authorization": f"Bearer {tok}"},
+                              json=body, timeout=120)
+            if r.status_code == 200:
+                raw = None
+                if str(r.headers.get("content-type", "")).startswith("image/"):
+                    raw = r.content
+                else:
+                    b64 = ((r.json() or {}).get("result") or {}).get("image")
+                    raw = base64.b64decode(b64) if b64 else None
+                if raw:
+                    open(path, "wb").write(raw)
+                    fit_user_photo(path, path)
+                    print("Cloudflare AI 그림 만들기 성공", size or "기본 크기")
+                    return True
+                print("Cloudflare AI 가 그림을 돌려주지 않았어요")
+                return False
+            print(f"Cloudflare AI 오류 {r.status_code}:", r.text[:200].replace("\n", " "))
+            if r.status_code in (400, 422) and size:
+                continue                              # 크기 설정 문제 → 더 작은 크기로 재시도
+            if r.status_code in (401, 403, 429):
+                _cf_off = True                        # 키/한도 문제 → 이번 실행에서는 더 시도 안 함
+            return False
+    except Exception as e:
+        print("Cloudflare AI 실패:", str(e)[:150])
+        _cf_off = True
+    return False
+
+
+def generate_ai_image(image_prompt, path):
+    """AI 그림 만들기: Cloudflare(무료) 먼저, 설정했다면 Gemini. 실패하면 False."""
+    if not image_prompt:
+        return False
+    if _cf_image(image_prompt, path):
+        return True
+    if os.environ.get("AI_GEMINI") == "1":
+        return _gemini_image(image_prompt, path)
     return False
 
 
@@ -353,7 +413,10 @@ def main():
     clips, credits = [], set()
     ids = [x.strip() for x in os.environ.get("PHOTO_IDS", "").split(",") if x.strip()]
     mine = download_user_photos(ids) if ids else []
-    ai_on = os.environ.get("AI_IMAGES", "0") == "1" and bool(os.environ.get("GEMINI_API_KEY"))
+    cf_ready = bool(os.environ.get("CLOUDFLARE_ACCOUNT_ID") and os.environ.get("CLOUDFLARE_API_TOKEN"))
+    gem_ready = os.environ.get("AI_GEMINI") == "1" and bool(os.environ.get("GEMINI_API_KEY"))
+    ai_on = os.environ.get("AI_IMAGES", "0") == "1" and (cf_ready or gem_ready)
+    print("AI 그림 사용:", ai_on, "(Cloudflare:", cf_ready, ", Gemini:", gem_ready, ")")
     for i, s in enumerate(scenes):
         bg = f"{OUT}/bg{i}.jpg"
         ov, mp3, mp4 = f"{OUT}/ov{i}.png", f"{OUT}/s{i}.mp3", f"{OUT}/s{i}.mp4"
