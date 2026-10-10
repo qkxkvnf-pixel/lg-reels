@@ -43,7 +43,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PHOTO_IDS: ${{ github.event.inputs.photos }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          AI_IMAGES: "1"   # 1 = AI 그림 사용, 0 = 끄기(무료 사진만)
+          AI_IMAGES: "0"   # 1 = AI 그림 사용, 0 = 끄기(무료 사진만)
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           GH_TOKEN: ${{ github.token }}
