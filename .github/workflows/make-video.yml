@@ -44,6 +44,7 @@ jobs:
           PHOTO_IDS: ${{ github.event.inputs.photos }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           AI_IMAGES: "1"   # 1 = AI 그림 사용, 0 = 끄기(무료 사진만)
+          AI_STYLE_NAME: "flat"   # 그림 스타일: flat(플랫 일러스트) / watercolor(수채화) / cartoon(카툰) / 3d
           AI_GEMINI: "0"   # Gemini 그림은 무료 한도가 없어서 꺼 둠 (유료로 켤 때만 1)
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
