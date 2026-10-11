@@ -184,8 +184,18 @@ def fetch_photo(queries, path):
 
 
 # ---------------- AI 이미지 생성 (Gemini) ----------------
-AI_STYLE = ("Clean modern semi-realistic 3D illustration, soft natural lighting, "
-            "warm bright colors, shallow depth of field")
+# 그림 스타일: make-video.yml 의 AI_STYLE_NAME 값으로 고릅니다 (flat / watercolor / cartoon / 3d)
+STYLES = {
+    "flat": ("Flat vector illustration, clean geometric shapes, soft pastel color palette, "
+             "minimal detail, modern editorial news illustration"),
+    "watercolor": ("Soft watercolor illustration, gentle brush strokes, warm pastel colors, "
+                   "light paper texture, hand-painted look"),
+    "cartoon": ("Cute cartoon illustration, bold clean outlines, bright cheerful colors, "
+                "simple friendly shapes"),
+    "3d": ("Clean modern semi-realistic 3D illustration, soft natural lighting, "
+           "warm bright colors, shallow depth of field"),
+}
+AI_STYLE = STYLES.get(os.environ.get("AI_STYLE_NAME", "flat"), STYLES["flat"])
 AI_RULES = ("Vertical 9:16 composition. Main subject in the upper-middle of the frame, "
             "simple calm area in the lower third. No text, no letters, no logos, "
             "no brand names, no real people, no watermarks.")
@@ -274,7 +284,7 @@ def _gemini_image(image_prompt, path):
 CF_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 # FLUX 는 '~하지 마'라는 문장을 잘 못 알아들어서, 원하는 모습만 긍정문으로 적어요
 FLUX_RULES = ("Vertical composition, the main subject centered in the upper-middle of the frame, "
-              "calm simple empty space in the lower third, soft warm lighting, clean and tidy scene.")
+              "calm simple empty space in the lower third, soft warm lighting, clean and tidy illustration.")
 _cf_off = False
 
 
