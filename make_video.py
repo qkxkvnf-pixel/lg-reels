@@ -3,22 +3,37 @@ import edge_tts, requests
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H = 1080, 1920
-BW, BH = 1620, 2880          # 배경 사진은 1.5배 크기로 준비(확대 효과용)
+WIN_Y, WIN_W, WIN_H = 440, 1080, 920      # 사진이 보이는 '창' (위아래는 흰 바탕에 글자)
+BW, BH = 1620, 1380                        # 사진은 1.5배 크기로 준비(확대 효과용)
 VOICE = "ko-KR-SunHiNeural"
-CHANNEL = "가전 NEWS"
-FONT_PATHS = [
+CHANNEL = (os.environ.get("CHANNEL_NAME") or "").strip() or "가전 NEWS"
+# 제목은 굵고 꽉 찬 글씨, 본문은 둥글고 부드러운 글씨 (없으면 아래 예비 폰트 사용)
+TITLE_FONTS = [
+    "fonts/BlackHanSans-Regular.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothicExtraBold.ttf",
     "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+BODY_FONTS = [
+    "fonts/Jua-Regular.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
 OUT = "out"
 RED = (165, 0, 52)
+YELLOW = (255, 226, 0)
+INK = (20, 20, 20)
 
 
-def font(size):
-    for p in FONT_PATHS:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+def font(size, title=False):
+    for p in (TITLE_FONTS if title else BODY_FONTS):
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 1000:
+                return ImageFont.truetype(p, size)
+        except Exception:
+            continue
     return ImageFont.load_default()
 
 
@@ -48,21 +63,21 @@ def wrap(draw, text, fnt, max_w):
 
 
 def cover_resize(path):
-    """사진을 BW x BH 크기로 꽉 채워 자릅니다."""
+    """사진을 BW x BH 크기로 꽉 채워 자릅니다. (위쪽을 조금 더 살려서 자름)"""
     im = Image.open(path).convert("RGB")
     s = max(BW / im.width, BH / im.height)
     im = im.resize((int(im.width * s) + 1, int(im.height * s) + 1), Image.LANCZOS)
-    x, y = (im.width - BW) // 2, (im.height - BH) // 2
+    x, y = (im.width - BW) // 2, int((im.height - BH) * 0.4)
     im.crop((x, y, x + BW, y + BH)).save(path, quality=92)
 
 
 def gradient_bg(path):
-    """사진이 없을 때 쓰는 어두운 그라데이션 배경."""
+    """사진이 없을 때 쓰는 부드러운 파스텔 배경."""
     im = Image.new("RGB", (BW, BH))
     d = ImageDraw.Draw(im)
     for y in range(BH):
         t = y / BH
-        d.line([(0, y), (BW, y)], fill=(int(24 + 40 * t), int(26 + 12 * t), int(40 + 30 * t)))
+        d.line([(0, y), (BW, y)], fill=(int(235 - 40 * t), int(240 - 30 * t), int(250 - 25 * t)))
     im.save(path, quality=92)
 
 
@@ -70,9 +85,9 @@ _used_photo_ids = set()
 
 
 def fit_user_photo(src, dst):
-    """내가 보낸 사진을 영상 배경으로 만듭니다. 가로 사진은 흐린 배경 위에 선명하게 얹어요."""
+    """사진을 영상의 사진 창에 맞춥니다. 세로 사진은 양옆을 흐리게 채워서 잘리지 않게 해요."""
     im = Image.open(src).convert("RGB")
-    if im.width / im.height <= 0.9:          # 세로에 가까운 사진: 꽉 채우기
+    if im.width / im.height >= 0.9:          # 가로/정사각 사진: 꽉 채우기
         im.save(dst, quality=92)
         cover_resize(dst)
         return
@@ -81,11 +96,11 @@ def fit_user_photo(src, dst):
     cover = cover.resize((int(cover.width * s) + 1, int(cover.height * s) + 1), Image.LANCZOS)
     x, y = (cover.width - BW) // 2, (cover.height - BH) // 2
     bg = cover.crop((x, y, x + BW, y + BH)).filter(ImageFilter.GaussianBlur(45))
-    bg = Image.blend(bg, Image.new("RGB", (BW, BH), (0, 0, 0)), 0.35)
-    fw = BW
-    fh = int(im.height * fw / im.width)
+    bg = Image.blend(bg, Image.new("RGB", (BW, BH), (255, 255, 255)), 0.25)
+    fh = BH
+    fw = int(im.width * fh / im.height)
     fg = im.resize((fw, fh), Image.LANCZOS)
-    bg.paste(fg, (0, int(BH * 0.38) - fh // 2))
+    bg.paste(fg, ((BW - fw) // 2, 0))
     bg.save(dst, quality=92)
 
 
@@ -124,10 +139,10 @@ def fetch_pixabay(query, path):
     key = os.environ.get("PIXABAY_API_KEY")
     if not key:
         return False
-    base = {"key": key, "q": query, "image_type": "photo", "orientation": "vertical",
+    base = {"key": key, "q": query, "image_type": "photo", "orientation": "horizontal",
             "safesearch": "true", "per_page": 20}
     hits = []
-    for extra in ({"min_width": 720, "min_height": 1100}, {}):   # 큰 사진 우선
+    for extra in ({"min_width": 1000, "min_height": 700}, {}):   # 큰 사진 우선
         r = requests.get("https://pixabay.com/api/", params={**base, **extra}, timeout=30)
         r.raise_for_status()
         hits = [h for h in r.json().get("hits", [])
@@ -156,7 +171,7 @@ def fetch_pexels(query, path):
     if not key:
         return False
     r = requests.get("https://api.pexels.com/v1/search", headers={"Authorization": key},
-                     params={"query": query, "orientation": "portrait",
+                     params={"query": query, "orientation": "landscape",
                              "size": "large", "per_page": 12}, timeout=30)
     r.raise_for_status()
     photos = [p for p in r.json().get("photos", [])
@@ -196,8 +211,8 @@ STYLES = {
            "warm bright colors, shallow depth of field"),
 }
 AI_STYLE = STYLES.get(os.environ.get("AI_STYLE_NAME", "flat"), STYLES["flat"])
-AI_RULES = ("Vertical 9:16 composition. Main subject in the upper-middle of the frame, "
-            "simple calm area in the lower third. No text, no letters, no logos, "
+AI_RULES = ("Landscape-leaning 5:4 composition. Main subject centered in the frame, "
+            "simple uncluttered background. No text, no letters, no logos, "
             "no brand names, no real people, no watermarks.")
 _GAPI = "https://generativelanguage.googleapis.com/v1beta"
 _ai_models = None
@@ -249,7 +264,7 @@ def _gemini_image(image_prompt, path):
             for use_ratio in (True, False):
                 cfg = {"responseModalities": ["TEXT", "IMAGE"]}
                 if use_ratio:
-                    cfg["imageConfig"] = {"aspectRatio": "9:16"}
+                    cfg["imageConfig"] = {"aspectRatio": "5:4"}
                 r = requests.post(
                     f"{_GAPI}/models/{model}:generateContent",
                     headers={"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -283,8 +298,8 @@ def _gemini_image(image_prompt, path):
 # ---------------- Cloudflare Workers AI (무료 하루 10,000 Neurons) ----------------
 CF_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 # FLUX 는 '~하지 마'라는 문장을 잘 못 알아들어서, 원하는 모습만 긍정문으로 적어요
-FLUX_RULES = ("Vertical composition, the main subject centered in the upper-middle of the frame, "
-              "calm simple empty space in the lower third, soft warm lighting, clean and tidy illustration.")
+FLUX_RULES = ("Wide 6:5 composition, the main subject centered in the frame, simple uncluttered "
+              "background, soft warm lighting, clean and tidy illustration.")
 _cf_off = False
 
 
@@ -297,7 +312,7 @@ def _cf_image(image_prompt, path):
     url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_MODEL}"
     prompt = f"{AI_STYLE}. {image_prompt}. {FLUX_RULES}"
     try:
-        for size in ((1024, 1792), (768, 1344), None):      # 큰 세로 → 작은 세로 → 기본(정사각)
+        for size in ((1152, 960), (1024, 832), None):       # 가로로 약간 넓게 → 더 작게 → 기본(정사각)
             body = {"prompt": prompt, "steps": 4}
             if size:
                 body["width"], body["height"] = size
@@ -340,42 +355,50 @@ def generate_ai_image(image_prompt, path):
     return False
 
 
-def render_overlay(headline, narration, idx, total, path):
-    """사진 위에 얹을 투명한 뉴스 화면(상단 바, 헤드라인, 자막)."""
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+def _fit_lines(d, text, title, sizes, max_w, max_lines):
+    for size in sizes:
+        f = font(size, title)
+        lines = wrap(d, text, f, max_w)
+        if len(lines) <= max_lines:
+            return f, lines, size
+    f = font(sizes[-1], title)
+    return f, wrap(d, text, f, max_w)[:max_lines], sizes[-1]
+
+
+def render_overlay(headline, narration, idx, total, path, note=""):
+    """숏폼 느낌: 위에는 큰 제목, 가운데는 사진 창, 아래는 큰 자막. (사진 창은 투명)"""
+    img = Image.new("RGBA", (W, H), (255, 255, 255, 255))
     d = ImageDraw.Draw(img)
-    # 아래쪽 어두운 그라데이션(글자가 잘 보이게)
-    for y in range(780, H):
-        a = int(210 * (y - 780) / (H - 780))
-        d.line([(0, y), (W, y)], fill=(0, 0, 0, a))
-    # 상단 바
-    d.rectangle([0, 0, W, 170], fill=RED + (235,))
-    d.text((60, 55), CHANNEL, font=font(64), fill="white")
-    d.text((W - 60, 70), "NEWS BRIEF", font=font(44), fill=(255, 225, 232), anchor="ra")
-    # 헤드라인(하단 1/3 위쪽)
-    f = font(72)
-    hl = wrap(d, headline, f, W - 150)
-    h_h = len(hl) * 92 + 50
-    top = 1040
-    d.rectangle([0, top, W, top + h_h], fill=(255, 255, 255, 245))
-    d.rectangle([0, top, 24, top + h_h], fill=RED + (255,))
-    y = top + 25
-    for line in hl:
-        d.text((70, y), line, font=f, fill=(20, 20, 20))
-        y += 92
-    # 자막
-    f2 = font(56)
-    lines = wrap(d, narration, f2, W - 170)
-    box_h = len(lines) * 78 + 56
-    st = top + h_h + 50
-    d.rounded_rectangle([40, st, W - 40, st + box_h], radius=24, fill=(0, 0, 0, 175))
-    y = st + 28
+    d.rectangle([0, WIN_Y, W, WIN_Y + WIN_H - 1], fill=(0, 0, 0, 0))     # 사진이 보일 창
+
+    # 채널 이름 (노란 글씨 + 검은 테두리)
+    d.text((54, 40), CHANNEL, font=font(66, True), fill=YELLOW,
+           stroke_width=7, stroke_fill=(0, 0, 0))
+
+    # 큰 제목 + 형광펜 효과
+    f, lines, size = _fit_lines(d, headline, True, [104, 92, 80, 68], W - 110, 2)
+    y = 148
+    lh = int(size * 1.12)
     for line in lines:
-        d.text((80, y), line, font=f2, fill="white")
-        y += 78
+        bb = d.textbbox((W // 2, y), line, font=f, anchor="ma")
+        d.rectangle([bb[0] - 10, y + int(size * 0.55), bb[2] + 10, bb[3] + 2], fill=YELLOW + (255,))
+        d.text((W // 2, y), line, font=f, fill=INK, anchor="ma")
+        y += lh
+    if note:
+        d.text((W // 2, WIN_Y - 46), note, font=font(30), fill=(120, 120, 120), anchor="ma")
+
+    # 아래 큰 자막
+    top = WIN_Y + WIN_H + 50
+    f2, lines2, size2 = _fit_lines(d, narration, False, [76, 70, 64, 58, 52], W - 130, 5)
+    block = len(lines2) * int(size2 * 1.3)
+    y = top + max(0, (H - 70 - top - block) // 2)
+    for line in lines2:
+        d.text((W // 2, y), line, font=f2, fill=INK, anchor="ma")
+        y += int(size2 * 1.3)
+
     # 진행바
-    d.rectangle([0, H - 36, W, H], fill=(255, 255, 255, 70))
-    d.rectangle([0, H - 36, int(W * (idx + 1) / total), H], fill=RED + (255,))
+    d.rectangle([0, H - 26, W, H], fill=(225, 225, 225, 255))
+    d.rectangle([0, H - 26, int(W * (idx + 1) / total), H], fill=RED + (255,))
     img.save(path)
 
 
@@ -396,15 +419,17 @@ def duration(path):
 
 
 def make_clip(bg, overlay, mp3, mp4, dur, zoom_in, pan=0):
-    """사진을 천천히 확대/축소하면서 뉴스 화면을 얹고 음성을 붙입니다."""
+    """사진을 창 안에서 천천히 확대/축소하고, 위아래 글자 화면을 얹은 뒤 음성을 붙입니다."""
     frames = int(dur * 30) + 3
     z = ("min(1.0+0.0006*on,1.15)" if zoom_in else "max(1.0,1.15-0.0006*on)")
     xs = ["iw/2-(iw/zoom/2)", "(iw-iw/zoom)*0.2", "(iw-iw/zoom)*0.8"][pan % 3]
     fc = (f"[0:v]zoompan=z='{z}':x='{xs}':y='ih/2-(ih/zoom/2)'"
-          f":d={frames}:s={W}x{H}:fps=30[bg];"
-          f"[bg][1:v]overlay=0:0:format=auto,format=yuv420p[v]")
-    run(["ffmpeg", "-y", "-i", bg, "-loop", "1", "-framerate", "30", "-i", overlay,
-         "-i", mp3, "-filter_complex", fc, "-map", "[v]", "-map", "2:a",
+          f":d={frames}:s={WIN_W}x{WIN_H}:fps=30[img];"
+          f"[1:v][img]overlay=0:{WIN_Y}[base];"
+          f"[base][2:v]overlay=0:0:format=auto,format=yuv420p[v]")
+    run(["ffmpeg", "-y", "-i", bg, "-f", "lavfi", "-i", f"color=c=white:s={W}x{H}:r=30",
+         "-loop", "1", "-framerate", "30", "-i", overlay, "-i", mp3,
+         "-filter_complex", fc, "-map", "[v]", "-map", "3:a",
          "-t", f"{dur:.2f}", "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-af", "apad", mp4])
 
@@ -430,10 +455,12 @@ def main():
     for i, s in enumerate(scenes):
         bg = f"{OUT}/bg{i}.jpg"
         ov, mp3, mp4 = f"{OUT}/ov{i}.png", f"{OUT}/s{i}.mp3", f"{OUT}/s{i}.mp4"
+        note = ""
         if mine:
             fit_user_photo(mine[i % len(mine)], bg)           # 내가 보낸 사진
         elif ai_on and generate_ai_image(s.get("image_prompt"), bg):
             credits.add("AI")                                  # AI가 만든 그림
+            note = "이해를 돕기 위한 AI 일러스트가 포함되어 있어요"
         else:
             src = fetch_photo([s.get("image_query"), s.get("image_query_alt"),
                                "home appliances"], bg)
@@ -441,7 +468,7 @@ def main():
                 credits.add(src)
             else:
                 gradient_bg(bg)
-        render_overlay(s["headline"], s["narration"], i, len(scenes), ov)
+        render_overlay(s["headline"], s["narration"], i, len(scenes), ov, note)
         asyncio.run(tts(s["narration"], mp3))
         make_clip(bg, ov, mp3, mp4, duration(mp3) + 0.4, zoom_in=(i % 2 == 0), pan=i)
         clips.append(mp4)
