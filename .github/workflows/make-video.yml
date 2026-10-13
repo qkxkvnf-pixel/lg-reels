@@ -34,7 +34,7 @@ jobs:
           curl -fsSL -o fonts/Jua-Regular.ttf https://github.com/google/fonts/raw/main/ofl/jua/Jua-Regular.ttf || echo "본문 폰트 받기 실패"
           ls -la fonts
       - name: 패키지 설치
-        run: pip install -r requirements.txt
+        run: pip install --upgrade -r requirements.txt
       - name: 뉴스 고르고 대본 만들기
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -65,3 +65,13 @@ jobs:
           git config user.email "actions@github.com"
           git add used.json
           git diff --staged --quiet || (git commit -m "update used.json" && git pull --rebase --autostash && git push)
+      - name: 실패하면 텔레그램으로 알려주기
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=⚠️ 영상 제작에 실패했어요. 자세한 내용: ${RUN_URL}" > /dev/null
