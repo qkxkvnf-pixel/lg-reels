@@ -1,4 +1,5 @@
 edge-tts
+gTTS
 Pillow
 requests
 beautifulsoup4
