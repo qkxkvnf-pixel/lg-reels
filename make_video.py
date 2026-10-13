@@ -434,8 +434,68 @@ def make_clip(bg, overlay, mp3, mp4, dur, zoom_in, pan=0):
          "-c:a", "aac", "-af", "apad", mp4])
 
 
-async def tts(text, path):
+# ---------------- 음성 만들기 (여러 방법을 차례로 시도) ----------------
+# 1) edge-tts (마이크로소프트 무료 음성, 가끔 접속이 막혀요)
+# 2) Cloudflare MeloTTS (무료, 한국어)
+# 3) gTTS (구글 번역 음성, 마지막 예비)
+_providers = ["edge", "melo", "gtts"]
+_pi = 0
+
+
+async def _edge(text, path):
     await edge_tts.Communicate(text, VOICE, rate="+8%").save(path)
+
+
+def _melo(text, path):
+    acct = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    tok = os.environ.get("CLOUDFLARE_API_TOKEN")
+    if not (acct and tok):
+        raise RuntimeError("Cloudflare 키가 없어요")
+    r = requests.post(
+        f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/@cf/myshell-ai/melotts",
+        headers={"Authorization": f"Bearer {tok}"},
+        json={"prompt": text, "lang": "ko"}, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"MeloTTS 오류 {r.status_code}: {r.text[:150]}")
+    audio = ((r.json() or {}).get("result") or {}).get("audio")
+    if not audio:
+        raise RuntimeError("MeloTTS 가 음성을 돌려주지 않았어요")
+    open(path, "wb").write(base64.b64decode(audio))
+
+
+def _gtts(text, path):
+    from gtts import gTTS
+    raw = path + ".raw.mp3"
+    gTTS(text=text, lang="ko").save(raw)
+    run(["ffmpeg", "-y", "-i", raw, "-af", "atempo=1.12", path])   # 조금 빠르게
+
+
+def speak(text, path):
+    """성공할 때까지 방법을 바꿔가며 음성을 만듭니다. 한 영상 안에서는 같은 목소리를 이어서 써요."""
+    global _pi
+    while _pi < len(_providers):
+        name = _providers[_pi]
+        attempts = 3 if name == "edge" else 2
+        for n in range(attempts):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                if name == "edge":
+                    asyncio.run(_edge(text, path))
+                elif name == "melo":
+                    _melo(text, path)
+                else:
+                    _gtts(text, path)
+                if os.path.exists(path) and os.path.getsize(path) > 1000:
+                    print("음성 방법:", name)
+                    return name
+                raise RuntimeError("음성 파일이 비어 있어요")
+            except Exception as e:
+                print(f"음성 만들기 실패 ({name}, {n + 1}/{attempts}):", str(e)[:160])
+                time.sleep(5 * (n + 1))
+        print(f"{name} 음성은 지금 쓸 수 없어서 다음 방법으로 넘어가요")
+        _pi += 1
+    raise RuntimeError("모든 음성 만들기 방법이 실패했어요")
 
 
 def main():
@@ -469,7 +529,7 @@ def main():
             else:
                 gradient_bg(bg)
         render_overlay(s["headline"], s["narration"], i, len(scenes), ov, note)
-        asyncio.run(tts(s["narration"], mp3))
+        speak(s["narration"], mp3)
         make_clip(bg, ov, mp3, mp4, duration(mp3) + 0.4, zoom_in=(i % 2 == 0), pan=i)
         clips.append(mp4)
     with open(f"{OUT}/list.txt", "w") as f:
